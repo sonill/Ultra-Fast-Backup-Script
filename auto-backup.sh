@@ -4,12 +4,13 @@
 # Ultra-Fast Backup Script (Optional Archive Mode)
 #
 
-
 set -euo pipefail
 IFS=$'\n\t'
 
-# ========== CONFIGURATION ==========
+# ========== EARLY ERROR TRAP ==========
+trap 'echo "❌ Script failed at line $LINENO"; rm -f "$LOCK_FILE"; exit 1' ERR
 
+# ========== CONFIGURATION ==========
 CONFIG_FILE="${1:-/etc/backup_config.conf}"
 echo "[DEBUG] Starting script with config: $CONFIG_FILE"
 
@@ -27,6 +28,14 @@ LOG_FILE="${LOG_FILE_PATH:-"/var/log/backup_${DOMAIN_ID}.log"}"
 LOG_DIR=$(dirname "$LOG_FILE")
 LOCK_FILE="/var/lock/backup_${DOMAIN_ID}.lock"
 MAX_LOG_SIZE=10485760  # 10MB
+
+# ========== TOOL CHECKS ==========
+for cmd in rclone tar; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "❌ Required command not found: $cmd"
+        exit 1
+    fi
+done
 
 # ========== DEBUG OUTPUT ==========
 echo "[DEBUG] DOMAIN_ID: $DOMAIN_ID"
@@ -84,27 +93,31 @@ verify_backup() {
 cleanup_backups() {
     local dir="$1"
     local pattern="$2"
-    local keep_count="$3"
-    local remote_folder="$4"
-    local dry_run="$5"
-    local is_directory="$6"
+    local local_keep="$3"
+    local remote_keep="$4"
+    local remote_folder="$5"
+    local dry_run="$6"
+    local is_directory="$7"
 
-    echo "[*] Cleaning up old backups (keep last $keep_count)"
-
+    echo "[*] Cleaning up local backups (keep last $local_keep)"
     if [ "$is_directory" = "true" ]; then
         mapfile -t local_files < <(find "$dir" -mindepth 1 -maxdepth 1 -type d | sort -r)
     else
         mapfile -t local_files < <(ls -1t "$dir"/$pattern 2>/dev/null || true)
     fi
 
-    if [ "${#local_files[@]}" -gt "$keep_count" ]; then
-        for ((i=keep_count; i<${#local_files[@]}; i++)); do
+    if [ "${#local_files[@]}" -gt "$local_keep" ]; then
+        for ((i=local_keep; i<${#local_files[@]}; i++)); do
             echo "   🗑️ Deleting local: ${local_files[$i]}"
-            rm -rf "${local_files[$i]}"
+            if [ "$dry_run" != "true" ]; then
+                rm -rf "${local_files[$i]}"
+            else
+                echo "   [Dry Run] Would delete ${local_files[$i]}"
+            fi
         done
     fi
 
-    echo "[*] Cleaning up old remote backups"
+    echo "[*] Cleaning up remote backups (keep last $remote_keep)"
     local remote_files
     if [ "$is_directory" = "true" ]; then
         mapfile -t remote_files < <(rclone lsf "$GDRIVE_REMOTE_NAME:$remote_folder" --dirs-only 2>/dev/null | sort -r)
@@ -112,8 +125,8 @@ cleanup_backups() {
         mapfile -t remote_files < <(rclone lsf "$GDRIVE_REMOTE_NAME:$remote_folder" 2>/dev/null | grep -E '\.tar$' | sort -r)
     fi
 
-    if [ "${#remote_files[@]}" -gt "$keep_count" ]; then
-        for ((i=keep_count; i<${#remote_files[@]}; i++)); do
+    if [ "${#remote_files[@]}" -gt "$remote_keep" ]; then
+        for ((i=remote_keep; i<${#remote_files[@]}; i++)); do
             echo "   🗑️ Deleting remote: ${remote_files[$i]}"
             if [ "$dry_run" != "true" ]; then
                 if [ "$is_directory" = "true" ]; then
@@ -132,13 +145,16 @@ cleanup_backups() {
 
 echo "[*] $(date '+%Y-%m-%d %H:%M:%S') Backup started"
 
-required_vars=("SOURCE_DIR" "DEST_DIR" "GDRIVE_FOLDER_PATH" "KEEP_COUNT" "GDRIVE_REMOTE_NAME")
+required_vars=("SOURCE_DIR" "DEST_DIR" "GDRIVE_FOLDER_PATH" "GDRIVE_REMOTE_NAME")
 for var in "${required_vars[@]}"; do
     if [ -z "${!var:-}" ]; then
         echo "❌ Configuration error: Missing $var"
         exit 1
     fi
 done
+
+KEEP_COUNT_LOCAL=${KEEP_COUNT_LOCAL:-5}
+KEEP_COUNT_REMOTE=${KEEP_COUNT_REMOTE:-5}
 
 if [ ! -d "$SOURCE_DIR" ]; then
     echo "❌ Source directory $SOURCE_DIR not found"
@@ -158,6 +174,7 @@ if [ "$ARCHIVE_MODE" = true ]; then
 
     ARCHIVE_NAME="backup_$(date +%Y%m%d_%H%M%S).tar"
     ARCHIVE_PATH="$DEST_DIR/$ARCHIVE_NAME"
+
     echo "[*] Creating archive from $SOURCE_DIR"
 
     START_TIME=$(date +%s)
@@ -178,24 +195,30 @@ if [ "$ARCHIVE_MODE" = true ]; then
     rclone mkdir "$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH" || true
 
     echo "[*] Starting upload to Google Drive"
-    UPLOAD_CMD="rclone copy \"$ARCHIVE_PATH\" \"$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH\""
-    [ -n "${BWLIMIT:-}" ] && UPLOAD_CMD+=" --bwlimit $BWLIMIT"
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[Dry Run] Would upload archive $ARCHIVE_PATH to $GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH"
+    else
+        UPLOAD_CMD="rclone copy \"$ARCHIVE_PATH\" \"$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH\""
+        [ -n "${BWLIMIT:-}" ] && UPLOAD_CMD+=" --bwlimit $BWLIMIT"
 
-    START_UPLOAD=$(date +%s)
-    eval "$UPLOAD_CMD" || {
-        echo "❌ Upload failed"
-        exit 1
-    }
-    END_UPLOAD=$(date +%s)
+        START_UPLOAD=$(date +%s)
+        eval "$UPLOAD_CMD" || {
+            echo "❌ Upload failed"
+            exit 1
+        }
+        END_UPLOAD=$(date +%s)
+    fi
 
-    cleanup_backups "$DEST_DIR" "*.tar" "$KEEP_COUNT" "$GDRIVE_FOLDER_PATH" "${DRY_RUN:-false}" "false"
+    cleanup_backups "$DEST_DIR" "*.tar" "$KEEP_COUNT_LOCAL" "$KEEP_COUNT_REMOTE" "$GDRIVE_FOLDER_PATH" "${DRY_RUN:-false}" "false"
 
     BACKUP_SIZE=$(du -h "$ARCHIVE_PATH" | cut -f1)
     echo "✅ Backup completed successfully"
     echo "   Size:    $BACKUP_SIZE"
     echo "   Local:   $ARCHIVE_PATH"
     echo "   Remote:  $GDRIVE_FOLDER_PATH/$ARCHIVE_NAME"
-    echo "   Runtime: $((END_UPLOAD - START_UPLOAD)) seconds total"
+    if [ "$DRY_RUN" != "true" ]; then
+        echo "   Runtime: $((END_UPLOAD - START_UPLOAD)) seconds total"
+    fi
 
 else
     echo "[*] ARCHIVE_MODE=false — Uploading subdirectories in $SOURCE_DIR as-is"
@@ -204,14 +227,19 @@ else
         [ -d "$dir" ] || continue
         folder_name=$(basename "$dir")
         echo "[*] Uploading $folder_name"
-        rclone mkdir "$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH/$folder_name" || true
-        rclone copy "$dir" "$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH/$folder_name" ${BWLIMIT:+--bwlimit $BWLIMIT} || {
-            echo "❌ Failed to upload $folder_name"
-            exit 1
-        }
+
+        if [ "$DRY_RUN" = "true" ]; then
+            echo "[Dry Run] Would upload folder $folder_name to $GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH/$folder_name"
+        else
+            rclone mkdir "$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH/$folder_name" || true
+            rclone copy "$dir" "$GDRIVE_REMOTE_NAME:$GDRIVE_FOLDER_PATH/$folder_name" ${BWLIMIT:+--bwlimit $BWLIMIT} || {
+                echo "❌ Failed to upload $folder_name"
+                exit 1
+            }
+        fi
     done
 
-    cleanup_backups "$SOURCE_DIR" "" "$KEEP_COUNT" "$GDRIVE_FOLDER_PATH" "${DRY_RUN:-false}" "true"
+    cleanup_backups "$SOURCE_DIR" "" "$KEEP_COUNT_LOCAL" "$KEEP_COUNT_REMOTE" "$GDRIVE_FOLDER_PATH" "${DRY_RUN:-false}" "true"
     echo "✅ Folder upload completed successfully"
 fi
 
