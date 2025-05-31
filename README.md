@@ -31,5 +31,5 @@ Designed for reliability, efficiency, and easy automation.
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/ultra-fast-backup.git
-   cd ultra-fast-backup
+   git clon https://github.com/sonill/Ultra-Fast-Backup-Script.git
+   cd Ultra-Fast-Backup-Script
